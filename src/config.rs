@@ -8,7 +8,7 @@ pub struct ColumnVisibility {
     pub pid: bool,
     pub process: bool,
     pub user: bool,
-    pub rss: bool,
+    pub memory: bool,
 }
 
 impl Default for ColumnVisibility {
@@ -23,7 +23,7 @@ impl Default for ColumnVisibility {
             pid: true,
             process: true,
             user: true,
-            rss: true,
+            memory: true,
         }
     }
 }
@@ -75,7 +75,7 @@ impl Config {
             6 => self.columns.pid = !self.columns.pid,
             7 => self.columns.process = !self.columns.process,
             8 => self.columns.user = !self.columns.user,
-            9 => self.columns.rss = !self.columns.rss,
+            9 => self.columns.memory = !self.columns.memory,
             10 => self.graphs.network_activity = !self.graphs.network_activity,
             11 => self.graphs.connection_states = !self.graphs.connection_states,
             12 => self.graphs.process_stats = !self.graphs.process_stats,
@@ -100,7 +100,7 @@ impl Config {
             ("PID", OptionState::Toggle(self.columns.pid)),
             ("Process", OptionState::Toggle(self.columns.process)),
             ("User", OptionState::Toggle(self.columns.user)),
-            ("Memory", OptionState::Toggle(self.columns.rss)),
+            ("Memory", OptionState::Toggle(self.columns.memory)),
             ("Network Activity", OptionState::Toggle(self.graphs.network_activity)),
             ("Connection States", OptionState::Toggle(self.graphs.connection_states)),
             ("Process Stats", OptionState::Toggle(self.graphs.process_stats)),

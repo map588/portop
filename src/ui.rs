@@ -184,7 +184,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
             header: Cell::from("User"),
         });
     }
-    if cols.rss {
+    if cols.memory {
         col_defs.push(ColDef {
             constraint: Constraint::Length(W_MEM as u16),
             header: Cell::from(pad_to("Mem(MB)", W_MEM)),
@@ -196,21 +196,14 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         .style(header_style);
 
     let offset = app.table_offset;
-    let visible_end = (offset + viewport_height).min(app.filtered_entries.len());
+    let visible_end = (offset + viewport_height).min(app.filtered_len());
 
     let rows: Vec<Row> = app
-        .filtered_entries[offset..visible_end]
-        .iter()
+        .filtered_slice(offset, visible_end)
         .enumerate()
         .map(|(vi, entry)| {
             let i = vi + offset; // absolute index
-            let state_style = match entry.state.as_str() {
-                "LISTEN" => Style::default().fg(Color::Green),
-                "ESTABLISHED" => Style::default().fg(Color::Yellow),
-                "TIME_WAIT" | "CLOSE_WAIT" => Style::default().fg(Color::DarkGray),
-                "UNREPLIED" => Style::default().fg(Color::Magenta),
-                _ => Style::default().fg(Color::White),
-            };
+            let state_style = Style::default().fg(state_color(&entry.state));
 
             let mem_mb = format!("{:.1}", entry.process_mem as f64 / 1024.0);
 
@@ -258,7 +251,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
             if cols.user {
                 cells.push(Cell::from(entry.process_user.as_str()));
             }
-            if cols.rss {
+            if cols.memory {
                 cells.push(Cell::from(if entry.process_mem > 0 {
                     format!("{:>width$}", mem_mb, width = W_MEM)
                 } else {
@@ -286,7 +279,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let selected_info = if let Some(idx) = app.selected {
-        if let Some(entry) = app.filtered_entries.get(idx) {
+        if let Some(entry) = app.filtered_entry(idx) {
             if entry.pid > 0 {
                 format!(
                     " PID {} | {} | {}",
@@ -313,7 +306,7 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let left = Span::styled(
         format!(
             " {} ports |{} j/k nav | / filter | S sort | s signal | o options | r refresh | q quit ",
-            app.filtered_entries.len(),
+            app.filtered_len(),
             msg,
         ),
         Style::default().fg(Color::Black).bg(Color::Cyan),
@@ -329,7 +322,7 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_kill_dialog(f: &mut Frame, app: &App) {
-    let entry = app.selected.and_then(|i| app.filtered_entries.get(i));
+    let entry = app.selected.and_then(|i| app.filtered_entry(i));
 
     let msg = if let Some(e) = entry {
         if e.pid > 0 {

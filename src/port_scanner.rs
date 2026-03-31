@@ -28,17 +28,67 @@ pub fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 pub fn scan_ports() -> Vec<PortEntry> {
+    use std::collections::HashMap;
+
+    // Build inode->PID map once upfront instead of walking /proc/*/fd per inode
+    let inode_map = build_inode_pid_map();
+
     let mut entries = Vec::new();
-    scan_net_file("/proc/net/tcp", "tcp", &mut entries);
-    scan_net_file("/proc/net/tcp6", "tcp6", &mut entries);
-    scan_net_file("/proc/net/udp", "udp", &mut entries);
-    scan_net_file("/proc/net/udp6", "udp6", &mut entries);
+    scan_net_file("/proc/net/tcp", "tcp", &inode_map, &mut entries);
+    scan_net_file("/proc/net/tcp6", "tcp6", &inode_map, &mut entries);
+    scan_net_file("/proc/net/udp", "udp", &inode_map, &mut entries);
+    scan_net_file("/proc/net/udp6", "udp6", &inode_map, &mut entries);
     entries.sort_by(|a, b| a.local_port.cmp(&b.local_port));
     entries
 }
 
+/// Build a reverse map of socket inode -> PID by scanning /proc/*/fd once.
 #[cfg(target_os = "linux")]
-fn scan_net_file(path: &str, proto: &str, entries: &mut Vec<PortEntry>) {
+fn build_inode_pid_map() -> std::collections::HashMap<String, u32> {
+    use std::collections::HashMap;
+
+    let mut map = HashMap::new();
+    let proc_dir = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return map,
+    };
+
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let pid = match name_str.parse::<u32>() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let fd_path = format!("/proc/{}/fd", pid);
+        let fd_dir = match std::fs::read_dir(&fd_path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        for fd_entry in fd_dir.flatten() {
+            if let Ok(link) = std::fs::read_link(fd_entry.path()) {
+                let link_str = link.to_string_lossy();
+                // Format: "socket:[12345]"
+                if let Some(rest) = link_str.strip_prefix("socket:[") {
+                    if let Some(inode) = rest.strip_suffix(']') {
+                        map.insert(inode.to_string(), pid);
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+#[cfg(target_os = "linux")]
+fn scan_net_file(
+    path: &str,
+    proto: &str,
+    inode_map: &std::collections::HashMap<String, u32>,
+    entries: &mut Vec<PortEntry>,
+) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return,
@@ -60,7 +110,11 @@ fn scan_net_file(path: &str, proto: &str, entries: &mut Vec<PortEntry>) {
 
         let state = decode_state(state_raw, proto);
 
-        let pid = find_pid_by_inode(inode);
+        let pid = if *inode != "0" {
+            inode_map.get(*inode).copied().unwrap_or(0)
+        } else {
+            0
+        };
 
         let (process_name, process_cmdline, process_user) = if pid > 0 {
             get_process_info_linux(pid)
@@ -154,34 +208,6 @@ fn decode_state(state_hex: &str, proto: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn find_pid_by_inode(inode: &str) -> u32 {
-    if inode == "0" {
-        return 0;
-    }
-
-    if let Ok(proc_dir) = std::fs::read_dir("/proc") {
-        for entry in proc_dir.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if let Ok(pid) = name_str.parse::<u32>() {
-                let fd_path = format!("/proc/{}/fd", pid);
-                if let Ok(fd_dir) = std::fs::read_dir(&fd_path) {
-                    for fd_entry in fd_dir.flatten() {
-                        if let Ok(link) = std::fs::read_link(fd_entry.path()) {
-                            let link_str = link.to_string_lossy();
-                            if link_str.contains(&format!("socket:[{}]", inode)) {
-                                return pid;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    0
-}
-
-#[cfg(target_os = "linux")]
 fn get_process_info_linux(pid: u32) -> (String, String, String) {
     let name = std::fs::read_to_string(format!("/proc/{}/comm", pid))
         .map(|s| s.trim().to_string())
@@ -231,8 +257,81 @@ fn username_from_uid(uid: u32) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// macOS: parse `lsof -i -n -P` output
+// macOS: parse `lsof -i -n -P` output + batched `ps` for process details
 // ---------------------------------------------------------------------------
+
+/// Process info fetched via a single batched `ps` call.
+#[cfg(target_os = "macos")]
+struct ProcessInfo {
+    cmdline: String,
+    rss_kb: u64,
+}
+
+/// Batch-fetch cmdline and RSS for all given PIDs in a single `ps` invocation.
+#[cfg(target_os = "macos")]
+fn batch_process_info(pids: &[u32]) -> std::collections::HashMap<u32, ProcessInfo> {
+    use std::collections::HashMap;
+    use std::process::Command;
+
+    let mut map = HashMap::new();
+    if pids.is_empty() {
+        return map;
+    }
+
+    // ps -o pid=,rss=,command= -p pid1,pid2,pid3
+    let pid_list: String = pids
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let output = match Command::new("ps")
+        .args(["-o", "pid=,rss=,command=", "-p", &pid_list])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return map,
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Format: "  PID   RSS COMMAND..."
+        // Split into at most 3 parts: pid, rss, rest-is-command
+        let mut parts = line.splitn(3, char::is_whitespace);
+        let pid_str = match parts.next() {
+            Some(s) => s.trim(),
+            None => continue,
+        };
+        let rss_str = loop {
+            // skip empty parts from multiple spaces
+            match parts.next() {
+                Some(s) if s.trim().is_empty() => continue,
+                Some(s) => break s.trim(),
+                None => break "0",
+            }
+        };
+        let cmdline = loop {
+            match parts.next() {
+                Some(s) if s.trim().is_empty() => continue,
+                Some(s) => break s.trim().to_string(),
+                None => break String::new(),
+            }
+        };
+
+        let pid: u32 = match pid_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let rss_kb: u64 = rss_str.parse().unwrap_or(0);
+
+        map.insert(pid, ProcessInfo { cmdline, rss_kb });
+    }
+    map
+}
 
 #[cfg(target_os = "macos")]
 pub fn scan_ports() -> Vec<PortEntry> {
@@ -247,13 +346,35 @@ pub fn scan_ports() -> Vec<PortEntry> {
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut entries = Vec::new();
+
+    // First pass: parse lsof lines to get basic entries and collect PIDs
+    let mut raw_entries: Vec<(PortEntry, u32)> = Vec::new();
+    let mut pids: Vec<u32> = Vec::new();
 
     for line in stdout.lines().skip(1) {
         if let Some(entry) = parse_lsof_line(line) {
-            entries.push(entry);
+            let pid = entry.pid;
+            if pid > 0 && !pids.contains(&pid) {
+                pids.push(pid);
+            }
+            raw_entries.push((entry, pid));
         }
     }
+
+    // Single batched ps call for all PIDs
+    let proc_info = batch_process_info(&pids);
+
+    // Enrich entries with process details
+    let mut entries: Vec<PortEntry> = raw_entries
+        .into_iter()
+        .map(|(mut entry, pid)| {
+            if let Some(info) = proc_info.get(&pid) {
+                entry.process_cmdline = info.cmdline.clone();
+                entry.process_mem = info.rss_kb;
+            }
+            entry
+        })
+        .collect();
 
     entries.sort_by(|a, b| a.local_port.cmp(&b.local_port));
     entries
@@ -268,7 +389,7 @@ fn parse_lsof_line(line: &str) -> Option<PortEntry> {
         return None;
     }
 
-    let process_name = fields[0].to_string();
+    let process_name = decode_lsof_escapes(fields[0]);
     let pid: u32 = fields[1].parse().ok()?;
     let process_user = fields[2].to_string();
     let node = fields[7]; // TCP or UDP
@@ -289,9 +410,6 @@ fn parse_lsof_line(line: &str) -> Option<PortEntry> {
     let (local_addr, local_port, remote_addr, remote_port, state) =
         parse_lsof_name(&name, protocol)?;
 
-    let cmdline = get_cmdline_macos(pid);
-    let process_mem = get_rss_macos(pid);
-
     Some(PortEntry {
         protocol: protocol.to_string(),
         local_addr,
@@ -301,9 +419,9 @@ fn parse_lsof_line(line: &str) -> Option<PortEntry> {
         state,
         pid,
         process_name,
-        process_cmdline: cmdline,
+        process_cmdline: "—".to_string(), // filled in by batch_process_info
         process_user,
-        process_mem,
+        process_mem: 0, // filled in by batch_process_info
     })
 }
 
@@ -312,11 +430,6 @@ fn parse_lsof_name(
     name: &str,
     proto: &str,
 ) -> Option<(String, u16, String, u16, String)> {
-    // Formats:
-    //   TCP: "host:port->rhost:rport (STATE)" or "host:port (STATE)" or "*:port"
-    //   UDP: "host:port" or "*:port" or "host:port->rhost:rport"
-
-    // Strip trailing state like " (LISTEN)" or " (ESTABLISHED)"
     let (addr_part, state) = if let Some(idx) = name.rfind('(') {
         let s = name[idx + 1..].trim_end_matches(')').trim().to_string();
         (name[..idx].trim(), s)
@@ -324,7 +437,6 @@ fn parse_lsof_name(
         (name.trim(), if proto.starts_with("udp") { "OPEN".to_string() } else { String::new() })
     };
 
-    // Split on "->" for remote
     let (local_str, remote_str) = if let Some(idx) = addr_part.find("->") {
         (&addr_part[..idx], Some(&addr_part[idx + 2..]))
     } else {
@@ -341,9 +453,37 @@ fn parse_lsof_name(
     Some((local_addr, local_port, remote_addr, remote_port, state))
 }
 
+/// Decode lsof's `\xHH` escape sequences (e.g. `\x20` -> space).
+#[cfg(target_os = "macos")]
+fn decode_lsof_escapes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // Peek for 'x' followed by two hex digits
+            let mut tentative = chars.clone();
+            if tentative.next() == Some('x') {
+                let h1 = tentative.next();
+                let h2 = tentative.next();
+                if let (Some(d1), Some(d2)) = (h1, h2) {
+                    let hex = format!("{}{}", d1, d2);
+                    if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                        result.push(byte as char);
+                        chars = tentative; // consume the 3 chars
+                        continue;
+                    }
+                }
+            }
+            result.push(c);
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 #[cfg(target_os = "macos")]
 fn parse_host_port(s: &str) -> Option<(String, u16)> {
-    // "127.0.0.1:8080" or "*:5353" or "[::1]:80"
     if let Some(idx) = s.rfind(':') {
         let host = &s[..idx];
         let port: u16 = s[idx + 1..].parse().ok()?;
@@ -352,34 +492,4 @@ fn parse_host_port(s: &str) -> Option<(String, u16)> {
     } else {
         None
     }
-}
-
-#[cfg(target_os = "macos")]
-fn get_cmdline_macos(pid: u32) -> String {
-    use std::process::Command;
-    Command::new("ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() { None } else { Some(s) }
-        })
-        .unwrap_or_else(|| "—".to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn get_rss_macos(pid: u32) -> u64 {
-    use std::process::Command;
-    Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
-        .ok()
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u64>()
-                .ok()
-        })
-        .unwrap_or(0)
 }

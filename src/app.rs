@@ -50,7 +50,8 @@ struct ScanResult {
 
 pub struct App {
     pub entries: Vec<PortEntry>,
-    pub filtered_entries: Vec<PortEntry>,
+    /// Indices into `entries` for the currently visible (filtered + sorted) rows.
+    filtered_indices: Vec<usize>,
     pub selected: Option<usize>,
     pub mode: AppMode,
     pub filter: String,
@@ -65,23 +66,18 @@ pub struct App {
     pub sort_cursor: usize,
     pub table_offset: usize,
 
-    /// Channel to receive scan results from background thread.
     scan_rx: mpsc::Receiver<ScanResult>,
-    /// Flag to request an immediate refresh from the background thread.
     force_refresh: Arc<AtomicBool>,
-    /// Shared refresh interval the background thread reads.
     shared_interval: Arc<AtomicU64>,
-    /// Stored table area rect for mouse click resolution.
     pub table_area: ratatui::prelude::Rect,
 }
 
 impl App {
     pub fn new(refresh_interval: u64, protocol: &str) -> Self {
         let (scan_tx, scan_rx) = mpsc::channel();
-        let force_refresh = Arc::new(AtomicBool::new(true)); // trigger immediate first scan
+        let force_refresh = Arc::new(AtomicBool::new(true));
         let shared_interval = Arc::new(AtomicU64::new(refresh_interval));
 
-        // Spawn background scanner thread
         {
             let force_flag = Arc::clone(&force_refresh);
             let interval_ref = Arc::clone(&shared_interval);
@@ -92,7 +88,7 @@ impl App {
 
         Self {
             entries: Vec::new(),
-            filtered_entries: Vec::new(),
+            filtered_indices: Vec::new(),
             selected: None,
             mode: AppMode::Normal,
             filter: String::new(),
@@ -113,9 +109,30 @@ impl App {
         }
     }
 
-    /// Check for new data from the background scanner (non-blocking).
+    // -- Accessors for filtered view --
+
+    /// Number of visible (filtered) entries.
+    pub fn filtered_len(&self) -> usize {
+        self.filtered_indices.len()
+    }
+
+    /// Get a filtered entry by filtered-view index.
+    pub fn filtered_entry(&self, idx: usize) -> Option<&PortEntry> {
+        self.filtered_indices
+            .get(idx)
+            .and_then(|&i| self.entries.get(i))
+    }
+
+    /// Iterate over a slice of filtered entries (for the visible window).
+    pub fn filtered_slice(&self, start: usize, end: usize) -> impl Iterator<Item = &PortEntry> {
+        self.filtered_indices[start..end]
+            .iter()
+            .map(|&i| &self.entries[i])
+    }
+
+    // -- Data updates --
+
     fn poll_scan_results(&mut self) {
-        // Drain all pending results, keep only the latest
         let mut latest: Option<ScanResult> = None;
         while let Ok(result) = self.scan_rx.try_recv() {
             latest = Some(result);
@@ -128,7 +145,6 @@ impl App {
         }
     }
 
-    /// Request the background thread to refresh immediately.
     fn request_refresh(&self) {
         self.force_refresh.store(true, Ordering::Relaxed);
     }
@@ -137,10 +153,11 @@ impl App {
         let filter_lower = self.filter.to_lowercase();
         let proto = self.protocol_filter.to_lowercase();
 
-        self.filtered_entries = self
+        self.filtered_indices = self
             .entries
             .iter()
-            .filter(|e| {
+            .enumerate()
+            .filter(|(_, e)| {
                 if proto != "all" && !e.protocol.starts_with(&proto) {
                     return false;
                 }
@@ -160,27 +177,33 @@ impl App {
                 .to_lowercase();
                 searchable.contains(&filter_lower)
             })
-            .cloned()
+            .map(|(i, _)| i)
             .collect();
 
         self.sort_entries();
 
         if let Some(sel) = self.selected {
-            if sel >= self.filtered_entries.len() {
-                self.selected = if self.filtered_entries.is_empty() {
+            if sel >= self.filtered_indices.len() {
+                self.selected = if self.filtered_indices.is_empty() {
                     None
                 } else {
-                    Some(self.filtered_entries.len() - 1)
+                    Some(self.filtered_indices.len() - 1)
                 };
             }
-        } else if !self.filtered_entries.is_empty() {
+        } else if !self.filtered_indices.is_empty() {
             self.selected = Some(0);
         }
     }
 
     fn sort_entries(&mut self) {
-        self.filtered_entries.sort_by(|a, b| {
-            let cmp = match self.sort_field {
+        let entries = &self.entries;
+        let field = self.sort_field;
+        let ascending = self.sort_ascending;
+
+        self.filtered_indices.sort_by(|&ai, &bi| {
+            let a = &entries[ai];
+            let b = &entries[bi];
+            let cmp = match field {
                 SortField::Protocol => a.protocol.cmp(&b.protocol),
                 SortField::LocalAddr => a.local_addr.cmp(&b.local_addr),
                 SortField::LocalPort => a.local_port.cmp(&b.local_port),
@@ -190,13 +213,11 @@ impl App {
                 SortField::Pid => a.pid.cmp(&b.pid),
                 SortField::ProcessName => a.process_name.cmp(&b.process_name),
             };
-            if self.sort_ascending {
-                cmp
-            } else {
-                cmp.reverse()
-            }
+            if ascending { cmp } else { cmp.reverse() }
         });
     }
+
+    // -- Navigation --
 
     fn select_up(&mut self) {
         if let Some(sel) = self.selected {
@@ -208,7 +229,7 @@ impl App {
 
     fn select_down(&mut self) {
         if let Some(sel) = self.selected {
-            if sel < self.filtered_entries.len().saturating_sub(1) {
+            if sel < self.filtered_indices.len().saturating_sub(1) {
                 self.selected = Some(sel + 1);
             }
         }
@@ -236,7 +257,7 @@ impl App {
 
     fn do_kill(&mut self, signal: i32) {
         if let Some(idx) = self.selected {
-            if let Some(entry) = self.filtered_entries.get(idx) {
+            if let Some(entry) = self.filtered_entry(idx) {
                 let pid = entry.pid;
                 let name = entry.process_name.clone();
                 let sig_name = if signal == 9 { "SIGKILL" } else { "SIGTERM" };
@@ -261,6 +282,8 @@ impl App {
         }
         self.mode = AppMode::Normal;
     }
+
+    // -- Input handling --
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         match self.mode {
@@ -298,10 +321,10 @@ impl App {
                 KeyCode::Char('j') | KeyCode::Down => self.select_down(),
                 KeyCode::Char('g') => self.selected = Some(0),
                 KeyCode::Char('G') => {
-                    self.selected = if self.filtered_entries.is_empty() {
+                    self.selected = if self.filtered_indices.is_empty() {
                         None
                     } else {
-                        Some(self.filtered_entries.len() - 1)
+                        Some(self.filtered_indices.len() - 1)
                     }
                 }
                 KeyCode::PageUp => {
@@ -312,7 +335,7 @@ impl App {
                 KeyCode::PageDown => {
                     if let Some(sel) = self.selected {
                         self.selected = Some(
-                            (sel + 10).min(self.filtered_entries.len().saturating_sub(1)),
+                            (sel + 10).min(self.filtered_indices.len().saturating_sub(1)),
                         );
                     }
                 }
@@ -404,10 +427,8 @@ impl App {
                 let row = event.row;
                 let ta = self.table_area;
 
-                // Check if click is within the table data area
-                // Table has: 1 border top + 1 header row, then data rows
                 let data_start_y = ta.y + 2;
-                let data_end_y = ta.y + ta.height.saturating_sub(1); // exclude bottom border
+                let data_end_y = ta.y + ta.height.saturating_sub(1);
 
                 if event.column >= ta.x
                     && event.column < ta.x + ta.width
@@ -416,7 +437,7 @@ impl App {
                 {
                     let clicked_row = (row - data_start_y) as usize;
                     let absolute_idx = self.table_offset + clicked_row;
-                    if absolute_idx < self.filtered_entries.len() {
+                    if absolute_idx < self.filtered_indices.len() {
                         self.selected = Some(absolute_idx);
                     }
                 }
@@ -428,15 +449,13 @@ impl App {
     }
 }
 
-/// Background thread: scans ports and collects network stats on a timer.
-/// Sends results over `tx`. Checks `force_flag` for immediate refresh requests.
 fn scanner_loop(
     tx: mpsc::Sender<ScanResult>,
     force_flag: Arc<AtomicBool>,
     interval: Arc<AtomicU64>,
 ) {
     let poll_interval = Duration::from_millis(100);
-    let mut last_scan = Instant::now() - Duration::from_secs(60); // ensure immediate first scan
+    let mut last_scan = Instant::now() - Duration::from_secs(60);
 
     loop {
         let current_interval = interval.load(Ordering::Relaxed);
@@ -449,7 +468,7 @@ fn scanner_loop(
             last_scan = Instant::now();
 
             if tx.send(ScanResult { entries, interface_stats }).is_err() {
-                return; // main thread dropped the receiver, exit
+                return;
             }
         }
 
@@ -458,15 +477,13 @@ fn scanner_loop(
 }
 
 pub fn run(mut terminal: Tui, app: &mut App) -> color_eyre::Result<()> {
-    let tick_rate = Duration::from_millis(50); // faster tick for responsive UI
+    let tick_rate = Duration::from_millis(50);
 
     loop {
-        // Check for new data from background scanner (non-blocking)
         app.poll_scan_results();
 
         terminal.draw(|f| ui::draw(f, &mut *app))?;
 
-        // Clear stale messages after 3s
         if let Some((_, ts)) = app.message {
             if ts.elapsed() > Duration::from_secs(3) {
                 app.message = None;
