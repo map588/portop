@@ -1,4 +1,7 @@
 mod app;
+mod config;
+mod metrics;
+mod net_stats;
 mod port_scanner;
 mod tui;
 mod ui;
@@ -6,7 +9,7 @@ mod ui;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "portmaster", about = "TUI for managing open ports and processes")]
+#[command(name = "portop", about = "TUI for managing open ports and processes")]
 struct Args {
     /// Refresh interval in seconds
     #[arg(short, long, default_value = "2")]
