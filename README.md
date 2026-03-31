@@ -22,12 +22,15 @@ Requires Rust 1.70+.
 
 ```sh
 # From source
-git clone https://github.com/matthewprock/portop.git
-cd portop
+git clone https://github.com/matthewprock/portop.git && cd portop
+
 cargo build --release
 sudo cp target/release/portop /usr/local/bin/
 
-# Or run directly
+# Or just install
+cargo install --path .
+
+# To 'try before you buy'
 cargo run --release
 ```
 
