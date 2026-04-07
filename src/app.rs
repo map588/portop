@@ -29,6 +29,7 @@ pub enum SortField {
     State,
     Pid,
     ProcessName,
+    Direction,
 }
 
 pub const SORT_FIELDS: &[(SortField, &str)] = &[
@@ -38,6 +39,7 @@ pub const SORT_FIELDS: &[(SortField, &str)] = &[
     (SortField::RemoteAddr, "Remote Address"),
     (SortField::RemotePort, "Remote Port"),
     (SortField::State, "State"),
+    (SortField::Direction, "Direction"),
     (SortField::Pid, "PID"),
     (SortField::ProcessName, "Process Name"),
 ];
@@ -165,12 +167,13 @@ impl App {
                     return true;
                 }
                 let searchable = format!(
-                    "{} {} {} {} {} {} {}",
+                    "{} {} {} {} {} {} {} {}",
                     e.protocol,
                     e.local_addr,
                     e.local_port,
                     e.remote_addr,
                     e.remote_port,
+                    e.direction,
                     e.process_name,
                     e.process_user,
                 )
@@ -212,6 +215,7 @@ impl App {
                 SortField::State => a.state.cmp(&b.state),
                 SortField::Pid => a.pid.cmp(&b.pid),
                 SortField::ProcessName => a.process_name.cmp(&b.process_name),
+                SortField::Direction => a.direction.cmp(&b.direction),
             };
             if ascending { cmp } else { cmp.reverse() }
         });

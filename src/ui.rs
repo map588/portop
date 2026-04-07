@@ -73,6 +73,7 @@ const W_PORT: usize = 5;
 const W_RADDR: usize = 15;
 const W_RPORT: usize = 5;
 const W_STATE: usize = 11;
+const W_DIR: usize = 10;
 const W_PID: usize = 7;
 const W_MEM: usize = 7;
 
@@ -163,6 +164,15 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
             )),
         });
     }
+    if cols.direction {
+        col_defs.push(ColDef {
+            constraint: Constraint::Length(W_DIR as u16),
+            header: Cell::from(pad_to(
+                format!("Direction{}", sort_arrow(app, SortField::Direction)),
+                W_DIR,
+            )),
+        });
+    }
     if cols.pid {
         col_defs.push(ColDef {
             constraint: Constraint::Length(W_PID as u16),
@@ -236,6 +246,21 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
                 cells.push(Cell::from(Span::styled(
                     pad_to(&entry.state, W_STATE),
                     state_style,
+                )));
+            }
+            if cols.direction {
+                let dir_style = Style::default().fg(direction_color(&entry.direction));
+                let dir_label = match entry.direction.as_str() {
+                    "Inbound" => "\u{25c2} In",
+                    "Outbound" => "\u{25b8} Out",
+                    "Listen" => "\u{25cf} Listen",
+                    "Loopback" => "\u{21c4} Loop",
+                    "Local" => "\u{00b7} Local",
+                    other => other,
+                };
+                cells.push(Cell::from(Span::styled(
+                    pad_to(dir_label, W_DIR),
+                    dir_style,
                 )));
             }
             if cols.pid {
@@ -642,6 +667,17 @@ fn state_color(state: &str) -> Color {
         "TIME_WAIT" | "CLOSE_WAIT" => Color::DarkGray,
         "UNREPLIED" | "OPEN" => Color::Magenta,
         "SYN_SENT" | "SYN_RECV" => Color::Red,
+        _ => Color::White,
+    }
+}
+
+fn direction_color(dir: &str) -> Color {
+    match dir {
+        "Listen" => Color::Green,
+        "Inbound" => Color::Cyan,
+        "Outbound" => Color::Yellow,
+        "Loopback" => Color::DarkGray,
+        "Local" => Color::Magenta,
         _ => Color::White,
     }
 }

@@ -87,3 +87,40 @@ pub fn collect_interface_stats() -> Vec<InterfaceStats> {
         })
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// Windows: parse netstat -e
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+pub fn collect_interface_stats() -> Vec<InterfaceStats> {
+    use std::process::Command;
+
+    let output = match Command::new("netstat").args(["-e"]).output() {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Format:
+    //                            Received            Sent
+    // Bytes                    123456789       987654321
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.starts_with("Bytes") {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 3 {
+                let rx: u64 = fields[1].parse().unwrap_or(0);
+                let tx: u64 = fields[2].parse().unwrap_or(0);
+                return vec![InterfaceStats {
+                    name: "all".to_string(),
+                    rx_bytes: rx,
+                    tx_bytes: tx,
+                }];
+            }
+        }
+    }
+
+    Vec::new()
+}

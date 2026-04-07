@@ -5,6 +5,7 @@ pub struct ColumnVisibility {
     pub remote_addr: bool,
     pub remote_port: bool,
     pub state: bool,
+    pub direction: bool,
     pub pid: bool,
     pub process: bool,
     pub user: bool,
@@ -20,6 +21,7 @@ impl Default for ColumnVisibility {
             remote_addr: true,
             remote_port: true,
             state: true,
+            direction: true,
             pid: true,
             process: true,
             user: true,
@@ -60,7 +62,7 @@ impl Config {
     }
 
     /// Total number of selectable option items in the menu.
-    pub const OPTION_COUNT: usize = 14; // 10 columns + 3 graphs + 1 interval
+    pub const OPTION_COUNT: usize = 15; // 11 columns + 3 graphs + 1 interval
 
     /// Toggle or adjust the option at the given cursor index.
     /// For toggles, flips the bool. For interval, no-op (use adjust_interval).
@@ -72,13 +74,14 @@ impl Config {
             3 => self.columns.remote_addr = !self.columns.remote_addr,
             4 => self.columns.remote_port = !self.columns.remote_port,
             5 => self.columns.state = !self.columns.state,
-            6 => self.columns.pid = !self.columns.pid,
-            7 => self.columns.process = !self.columns.process,
-            8 => self.columns.user = !self.columns.user,
-            9 => self.columns.memory = !self.columns.memory,
-            10 => self.graphs.network_activity = !self.graphs.network_activity,
-            11 => self.graphs.connection_states = !self.graphs.connection_states,
-            12 => self.graphs.process_stats = !self.graphs.process_stats,
+            6 => self.columns.direction = !self.columns.direction,
+            7 => self.columns.pid = !self.columns.pid,
+            8 => self.columns.process = !self.columns.process,
+            9 => self.columns.user = !self.columns.user,
+            10 => self.columns.memory = !self.columns.memory,
+            11 => self.graphs.network_activity = !self.graphs.network_activity,
+            12 => self.graphs.connection_states = !self.graphs.connection_states,
+            13 => self.graphs.process_stats = !self.graphs.process_stats,
             _ => {} // interval row — no-op for toggle
         }
     }
@@ -97,6 +100,7 @@ impl Config {
             ("Remote Address", OptionState::Toggle(self.columns.remote_addr)),
             ("Remote Port", OptionState::Toggle(self.columns.remote_port)),
             ("State", OptionState::Toggle(self.columns.state)),
+            ("Direction", OptionState::Toggle(self.columns.direction)),
             ("PID", OptionState::Toggle(self.columns.pid)),
             ("Process", OptionState::Toggle(self.columns.process)),
             ("User", OptionState::Toggle(self.columns.user)),
@@ -112,8 +116,8 @@ impl Config {
     pub fn section_for(index: usize) -> Option<&'static str> {
         match index {
             0 => Some("Columns"),
-            10 => Some("Graphs"),
-            13 => Some("Settings"),
+            11 => Some("Graphs"),
+            14 => Some("Settings"),
             _ => None,
         }
     }
