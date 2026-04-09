@@ -53,6 +53,8 @@ pub enum SortField {
     Pid,
     ProcessName,
     Direction,
+    User,
+    Memory,
 }
 
 pub const SORT_FIELDS: &[(SortField, &str)] = &[
@@ -65,6 +67,8 @@ pub const SORT_FIELDS: &[(SortField, &str)] = &[
     (SortField::Direction, "Direction"),
     (SortField::Pid, "PID"),
     (SortField::ProcessName, "Process Name"),
+    (SortField::User, "User"),
+    (SortField::Memory, "Memory"),
 ];
 
 /// Data produced by the background scanner thread.
@@ -174,6 +178,7 @@ impl App {
             self.apply_filter_and_sort();
             self.metrics.update(&self.entries, result.interface_stats);
             self.last_refresh = Instant::now();
+            self.refresh_detail();
         }
     }
 
@@ -247,6 +252,8 @@ impl App {
                 SortField::Pid => a.pid.cmp(&b.pid),
                 SortField::ProcessName => a.process_name.cmp(&b.process_name),
                 SortField::Direction => a.direction.cmp(&b.direction),
+                SortField::User => a.process_user.cmp(&b.process_user),
+                SortField::Memory => a.process_mem.cmp(&b.process_mem),
             };
             if ascending { cmp } else { cmp.reverse() }
         });
@@ -316,6 +323,31 @@ impl App {
             }
         }
         self.mode = AppMode::Normal;
+    }
+
+    fn refresh_detail(&mut self) {
+        if let Some(ref mut detail) = self.detail {
+            let pid = detail.pid;
+
+            // Update connections from latest entries
+            detail.connections = self
+                .entries
+                .iter()
+                .filter(|e| e.pid == pid)
+                .cloned()
+                .collect();
+
+            // Update process info from any matching entry
+            if let Some(entry) = self.entries.iter().find(|e| e.pid == pid) {
+                detail.name = entry.process_name.clone();
+                detail.cmdline = entry.process_cmdline.clone();
+                detail.user = entry.process_user.clone();
+                detail.mem_kb = entry.process_mem;
+            }
+
+            // Refresh open files
+            detail.open_files = gather_open_files(pid);
+        }
     }
 
     fn enter_detail(&mut self) {

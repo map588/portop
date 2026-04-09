@@ -181,8 +181,8 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         (cols.direction,  6,  "Direction", Some(SortField::Direction)),
         (cols.pid,        7,  "PID",       Some(SortField::Pid)),
         (cols.process,    8,  "Process",   Some(SortField::ProcessName)),
-        (cols.user,       9,  "User",      None),
-        (cols.memory,     10, "Mem(MB)",   None),
+        (cols.user,       9,  "User",      Some(SortField::User)),
+        (cols.memory,     10, "Mem(MB)",   Some(SortField::Memory)),
     ];
 
     for &(enabled, wi, label, sf) in col_specs {
@@ -201,11 +201,12 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         });
     }
 
-    // Build header hit-zones for mouse click sorting
+    // Build header hit-zones for mouse click sorting.
+    // Ratatui Table has a default column_spacing of 1 between cells.
     {
         let mut x = area.x + 1; // +1 for left border
         app.header_columns.clear();
-        for cd in &col_defs {
+        for (i, cd) in col_defs.iter().enumerate() {
             let w = match cd.constraint {
                 Constraint::Length(l) => l,
                 _ => 0,
@@ -214,6 +215,9 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
                 app.header_columns.push((x, x + w, field));
             }
             x += w;
+            if i < col_defs.len() - 1 {
+                x += 1; // column_spacing gap
+            }
         }
     }
 
