@@ -10,6 +10,28 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Detailed info gathered for a single process.
+#[derive(Debug, Clone)]
+pub struct ProcessDetail {
+    pub pid: u32,
+    pub name: String,
+    pub cmdline: String,
+    pub user: String,
+    pub mem_kb: u64,
+    /// All port entries belonging to this PID.
+    pub connections: Vec<PortEntry>,
+    /// Open file descriptors (from lsof).
+    pub open_files: Vec<OpenFile>,
+    pub scroll_offset: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenFile {
+    pub fd: String,
+    pub file_type: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppMode {
     Normal,
@@ -17,6 +39,7 @@ pub enum AppMode {
     ConfirmKill,
     Options,
     Sort,
+    Detail,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,6 +95,10 @@ pub struct App {
     force_refresh: Arc<AtomicBool>,
     shared_interval: Arc<AtomicU64>,
     pub table_area: ratatui::prelude::Rect,
+    /// Maps (x_start, x_end) ranges to SortField for header click detection.
+    pub header_columns: Vec<(u16, u16, SortField)>,
+    pub detail: Option<ProcessDetail>,
+    last_click: Option<(u16, u16, Instant)>,
 }
 
 impl App {
@@ -108,6 +135,9 @@ impl App {
             force_refresh,
             shared_interval,
             table_area: ratatui::prelude::Rect::default(),
+            header_columns: Vec::new(),
+            detail: None,
+            last_click: None,
         }
     }
 
@@ -287,6 +317,42 @@ impl App {
         self.mode = AppMode::Normal;
     }
 
+    fn enter_detail(&mut self) {
+        if let Some(idx) = self.selected {
+            if let Some(entry) = self.filtered_entry(idx) {
+                let pid = entry.pid;
+                if pid == 0 {
+                    return;
+                }
+                let name = entry.process_name.clone();
+                let cmdline = entry.process_cmdline.clone();
+                let user = entry.process_user.clone();
+                let mem_kb = entry.process_mem;
+
+                let connections: Vec<PortEntry> = self
+                    .entries
+                    .iter()
+                    .filter(|e| e.pid == pid)
+                    .cloned()
+                    .collect();
+
+                let open_files = gather_open_files(pid);
+
+                self.detail = Some(ProcessDetail {
+                    pid,
+                    name,
+                    cmdline,
+                    user,
+                    mem_kb,
+                    connections,
+                    open_files,
+                    scroll_offset: 0,
+                });
+                self.mode = AppMode::Detail;
+            }
+        }
+    }
+
     // -- Input handling --
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -321,6 +387,7 @@ impl App {
                 KeyCode::Char('3') => self.set_sort(SortField::State),
                 KeyCode::Char('4') => self.set_sort(SortField::Pid),
                 KeyCode::Char('5') => self.set_sort(SortField::ProcessName),
+                KeyCode::Enter => self.enter_detail(),
                 KeyCode::Char('k') | KeyCode::Up => self.select_up(),
                 KeyCode::Char('j') | KeyCode::Down => self.select_down(),
                 KeyCode::Char('g') => self.selected = Some(0),
@@ -400,6 +467,33 @@ impl App {
                 }
                 _ => {}
             },
+            AppMode::Detail => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                    self.mode = AppMode::Normal;
+                    self.detail = None;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let Some(ref mut d) = self.detail {
+                        d.scroll_offset = d.scroll_offset.saturating_add(1);
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Some(ref mut d) = self.detail {
+                        d.scroll_offset = d.scroll_offset.saturating_sub(1);
+                    }
+                }
+                KeyCode::PageDown => {
+                    if let Some(ref mut d) = self.detail {
+                        d.scroll_offset = d.scroll_offset.saturating_add(10);
+                    }
+                }
+                KeyCode::PageUp => {
+                    if let Some(ref mut d) = self.detail {
+                        d.scroll_offset = d.scroll_offset.saturating_sub(10);
+                    }
+                }
+                _ => {}
+            },
             AppMode::Sort => match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
                     if self.sort_cursor < SORT_FIELDS.len() - 1 {
@@ -426,23 +520,64 @@ impl App {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) {
+        if self.mode == AppMode::Detail {
+            match event.kind {
+                MouseEventKind::ScrollUp => {
+                    if let Some(ref mut d) = self.detail {
+                        d.scroll_offset = d.scroll_offset.saturating_sub(3);
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(ref mut d) = self.detail {
+                        d.scroll_offset = d.scroll_offset.saturating_add(3);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let row = event.row;
+                let col = event.column;
                 let ta = self.table_area;
 
+                let header_y = ta.y + 1;
                 let data_start_y = ta.y + 2;
                 let data_end_y = ta.y + ta.height.saturating_sub(1);
 
-                if event.column >= ta.x
-                    && event.column < ta.x + ta.width
+                if row == header_y {
+                    // Click on header row — sort by that column
+                    for &(x_start, x_end, field) in &self.header_columns {
+                        if col >= x_start && col < x_end {
+                            self.set_sort(field);
+                            break;
+                        }
+                    }
+                } else if col >= ta.x
+                    && col < ta.x + ta.width
                     && row >= data_start_y
                     && row < data_end_y
                 {
                     let clicked_row = (row - data_start_y) as usize;
                     let absolute_idx = self.table_offset + clicked_row;
                     if absolute_idx < self.filtered_indices.len() {
+                        // Double-click detection
+                        let is_double = if let Some((pr, pc, pt)) = self.last_click {
+                            pr == row && pc == col && pt.elapsed() < Duration::from_millis(400)
+                        } else {
+                            false
+                        };
+
                         self.selected = Some(absolute_idx);
+
+                        if is_double {
+                            self.enter_detail();
+                            self.last_click = None;
+                        } else {
+                            self.last_click = Some((row, col, Instant::now()));
+                        }
                     }
                 }
             }
@@ -478,6 +613,67 @@ fn scanner_loop(
 
         std::thread::sleep(poll_interval);
     }
+}
+
+/// Gather open files for a process using lsof.
+#[cfg(unix)]
+fn gather_open_files(pid: u32) -> Vec<OpenFile> {
+    use std::process::Command;
+
+    let output = match Command::new("lsof")
+        .args(["-p", &pid.to_string(), "-n", "-P", "-w", "-F", "ftfn"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut files = Vec::new();
+    let mut fd = String::new();
+    let mut ftype = String::new();
+    let mut name = String::new();
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let (tag, value) = (line.as_bytes()[0], &line[1..]);
+        match tag {
+            b'f' => {
+                // Flush previous entry
+                if !fd.is_empty() && !name.is_empty() {
+                    files.push(OpenFile {
+                        fd: fd.clone(),
+                        file_type: ftype.clone(),
+                        name: name.clone(),
+                    });
+                }
+                fd = value.to_string();
+                ftype.clear();
+                name.clear();
+            }
+            b't' => ftype = value.to_string(),
+            b'n' => name = value.to_string(),
+            _ => {}
+        }
+    }
+    // Flush last
+    if !fd.is_empty() && !name.is_empty() {
+        files.push(OpenFile {
+            fd,
+            file_type: ftype,
+            name,
+        });
+    }
+
+    files
+}
+
+#[cfg(target_os = "windows")]
+fn gather_open_files(_pid: u32) -> Vec<OpenFile> {
+    // Windows doesn't have lsof; could use handle.exe but it's not standard
+    Vec::new()
 }
 
 pub fn run(mut terminal: Tui, app: &mut App) -> color_eyre::Result<()> {

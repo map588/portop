@@ -48,6 +48,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.mode == AppMode::Sort {
         draw_sort_menu(f, app);
     }
+    if app.mode == AppMode::Detail {
+        draw_detail_view(f, app);
+    }
 }
 
 fn draw_search_bar(f: &mut Frame, app: &App, area: Rect) {
@@ -66,17 +69,6 @@ fn draw_search_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(bar, area);
 }
 
-// Column display widths
-const W_PROTO: usize = 5;
-const W_LADDR: usize = 15;
-const W_PORT: usize = 5;
-const W_RADDR: usize = 15;
-const W_RPORT: usize = 5;
-const W_STATE: usize = 11;
-const W_DIR: usize = 10;
-const W_PID: usize = 7;
-const W_MEM: usize = 7;
-
 fn sort_arrow(app: &App, field: SortField) -> &'static str {
     if app.sort_field == field {
         if app.sort_ascending {
@@ -89,10 +81,76 @@ fn sort_arrow(app: &App, field: SortField) -> &'static str {
     }
 }
 
+fn dir_label(direction: &str) -> &'static str {
+    match direction {
+        "Inbound" => "\u{25c2} In",
+        "Outbound" => "\u{25b8} Out",
+        "Listen" => "\u{25cf} Listen",
+        "Loopback" => "\u{21c4} Loop",
+        "Local" => "\u{00b7} Local",
+        _ => "—",
+    }
+}
+
+/// Compute auto-fit column widths by scanning all filtered entries.
+/// Returns (proto, laddr, lport, raddr, rport, state, dir, pid, process, user, mem).
+fn compute_column_widths(app: &App) -> [usize; 11] {
+    // Start with header widths (including sort arrow space)
+    let mut w = [
+        display_width("Proto") + 1,  // proto
+        display_width("L-Addr") + 1, // local_addr
+        display_width("Port") + 1,   // local_port
+        display_width("R-Addr") + 1, // remote_addr
+        display_width("RP") + 1,     // remote_port
+        display_width("State") + 1,  // state
+        display_width("Direction") + 1, // direction
+        display_width("PID") + 1,    // pid
+        display_width("Process") + 1,// process
+        display_width("User"),       // user
+        display_width("Mem(MB)"),    // mem
+    ];
+
+    for i in 0..app.filtered_len() {
+        if let Some(e) = app.filtered_entry(i) {
+            w[0] = w[0].max(e.protocol.len());
+            w[1] = w[1].max(display_width(&e.local_addr));
+            w[2] = w[2].max(format!("{}", e.local_port).len());
+            w[3] = w[3].max(display_width(&e.remote_addr));
+            w[4] = w[4].max(if e.remote_port > 0 {
+                format!("{}", e.remote_port).len()
+            } else {
+                1
+            });
+            w[5] = w[5].max(display_width(&e.state));
+            w[6] = w[6].max(display_width(dir_label(&e.direction)));
+            w[7] = w[7].max(if e.pid > 0 {
+                format!("{}", e.pid).len()
+            } else {
+                1
+            });
+            w[8] = w[8].max(display_width(&e.process_name));
+            w[9] = w[9].max(display_width(&e.process_user));
+            w[10] = w[10].max(if e.process_mem > 0 {
+                format!("{:.1}", e.process_mem as f64 / 1024.0).len()
+            } else {
+                1
+            });
+        }
+    }
+
+    // Add 1 char padding to each column
+    for v in &mut w {
+        *v += 1;
+    }
+
+    w
+}
+
 /// Helper to build a visible column definition.
 struct ColDef {
     constraint: Constraint,
     header: Cell<'static>,
+    sort_field: Option<SortField>,
 }
 
 fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
@@ -106,99 +164,56 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     app.ensure_visible(viewport_height);
 
     let cols = &app.config.columns;
+    let cw = compute_column_widths(app);
 
     // Build visible column definitions
     let mut col_defs: Vec<ColDef> = Vec::new();
 
-    if cols.proto {
+    // (enabled, width_idx, header_label, sort_field)
+    let col_specs: &[(bool, usize, &str, Option<SortField>)] = &[
+        (cols.proto,      0,  "Proto",     Some(SortField::Protocol)),
+        (cols.local_addr, 1,  "L-Addr",    Some(SortField::LocalAddr)),
+        (cols.local_port, 2,  "Port",      Some(SortField::LocalPort)),
+        (cols.remote_addr,3,  "R-Addr",    Some(SortField::RemoteAddr)),
+        (cols.remote_port,4,  "RP",        Some(SortField::RemotePort)),
+        (cols.state,      5,  "State",     Some(SortField::State)),
+        (cols.direction,  6,  "Direction", Some(SortField::Direction)),
+        (cols.pid,        7,  "PID",       Some(SortField::Pid)),
+        (cols.process,    8,  "Process",   Some(SortField::ProcessName)),
+        (cols.user,       9,  "User",      None),
+        (cols.memory,     10, "Mem(MB)",   None),
+    ];
+
+    for &(enabled, wi, label, sf) in col_specs {
+        if !enabled {
+            continue;
+        }
+        let header_text = if let Some(field) = sf {
+            pad_to(format!("{}{}", label, sort_arrow(app, field)), cw[wi])
+        } else {
+            pad_to(label, cw[wi])
+        };
         col_defs.push(ColDef {
-            constraint: Constraint::Length(W_PROTO as u16),
-            header: Cell::from(pad_to(
-                format!("Proto{}", sort_arrow(app, SortField::Protocol)),
-                W_PROTO,
-            )),
+            constraint: Constraint::Length(cw[wi] as u16),
+            header: Cell::from(header_text),
+            sort_field: sf,
         });
     }
-    if cols.local_addr {
-        col_defs.push(ColDef {
-            constraint: Constraint::Length(W_LADDR as u16),
-            header: Cell::from(pad_to(
-                format!("L-Addr{}", sort_arrow(app, SortField::LocalAddr)),
-                W_LADDR,
-            )),
-        });
-    }
-    if cols.local_port {
-        col_defs.push(ColDef {
-            constraint: Constraint::Length((W_PORT + 1) as u16),
-            header: Cell::from(pad_to(
-                format!("Port{}", sort_arrow(app, SortField::LocalPort)),
-                W_PORT + 1,
-            )),
-        });
-    }
-    if cols.remote_addr {
-        col_defs.push(ColDef {
-            constraint: Constraint::Length(W_RADDR as u16),
-            header: Cell::from(pad_to(
-                format!("R-Addr{}", sort_arrow(app, SortField::RemoteAddr)),
-                W_RADDR,
-            )),
-        });
-    }
-    if cols.remote_port {
-        col_defs.push(ColDef {
-            constraint: Constraint::Length(W_RPORT as u16),
-            header: Cell::from(pad_to(
-                format!("RP{}", sort_arrow(app, SortField::RemotePort)),
-                W_RPORT,
-            )),
-        });
-    }
-    if cols.state {
-        col_defs.push(ColDef {
-            constraint: Constraint::Length(W_STATE as u16),
-            header: Cell::from(pad_to(
-                format!("State{}", sort_arrow(app, SortField::State)),
-                W_STATE,
-            )),
-        });
-    }
-    if cols.direction {
-        col_defs.push(ColDef {
-            constraint: Constraint::Length(W_DIR as u16),
-            header: Cell::from(pad_to(
-                format!("Direction{}", sort_arrow(app, SortField::Direction)),
-                W_DIR,
-            )),
-        });
-    }
-    if cols.pid {
-        col_defs.push(ColDef {
-            constraint: Constraint::Length(W_PID as u16),
-            header: Cell::from(pad_to(
-                format!("PID{}", sort_arrow(app, SortField::Pid)),
-                W_PID,
-            )),
-        });
-    }
-    if cols.process {
-        col_defs.push(ColDef {
-            constraint: Constraint::Fill(2),
-            header: Cell::from(format!("Process{}", sort_arrow(app, SortField::ProcessName))),
-        });
-    }
-    if cols.user {
-        col_defs.push(ColDef {
-            constraint: Constraint::Fill(1),
-            header: Cell::from("User"),
-        });
-    }
-    if cols.memory {
-        col_defs.push(ColDef {
-            constraint: Constraint::Length(W_MEM as u16),
-            header: Cell::from(pad_to("Mem(MB)", W_MEM)),
-        });
+
+    // Build header hit-zones for mouse click sorting
+    {
+        let mut x = area.x + 1; // +1 for left border
+        app.header_columns.clear();
+        for cd in &col_defs {
+            let w = match cd.constraint {
+                Constraint::Length(l) => l,
+                _ => 0,
+            };
+            if let Some(field) = cd.sort_field {
+                app.header_columns.push((x, x + w, field));
+            }
+            x += w;
+        }
     }
 
     let widths: Vec<Constraint> = col_defs.iter().map(|c| c.constraint).collect();
@@ -220,67 +235,59 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
             let mut cells: Vec<Cell> = Vec::new();
 
             if cols.proto {
-                cells.push(Cell::from(pad_to(&entry.protocol, W_PROTO)));
+                cells.push(Cell::from(pad_to(&entry.protocol, cw[0])));
             }
             if cols.local_addr {
-                cells.push(Cell::from(pad_to(&entry.local_addr, W_LADDR)));
+                cells.push(Cell::from(pad_to(&entry.local_addr, cw[1])));
             }
             if cols.local_port {
                 cells.push(Cell::from(format!(
                     "{:>width$}",
                     entry.local_port,
-                    width = W_PORT
+                    width = cw[2]
                 )));
             }
             if cols.remote_addr {
-                cells.push(Cell::from(pad_to(&entry.remote_addr, W_RADDR)));
+                cells.push(Cell::from(pad_to(&entry.remote_addr, cw[3])));
             }
             if cols.remote_port {
                 cells.push(Cell::from(if entry.remote_port > 0 {
-                    format!("{:>width$}", entry.remote_port, width = W_RPORT)
+                    format!("{:>width$}", entry.remote_port, width = cw[4])
                 } else {
-                    pad_to("—", W_RPORT)
+                    pad_to("—", cw[4])
                 }));
             }
             if cols.state {
                 cells.push(Cell::from(Span::styled(
-                    pad_to(&entry.state, W_STATE),
+                    pad_to(&entry.state, cw[5]),
                     state_style,
                 )));
             }
             if cols.direction {
-                let dir_style = Style::default().fg(direction_color(&entry.direction));
-                let dir_label = match entry.direction.as_str() {
-                    "Inbound" => "\u{25c2} In",
-                    "Outbound" => "\u{25b8} Out",
-                    "Listen" => "\u{25cf} Listen",
-                    "Loopback" => "\u{21c4} Loop",
-                    "Local" => "\u{00b7} Local",
-                    other => other,
-                };
+                let dstyle = Style::default().fg(direction_color(&entry.direction));
                 cells.push(Cell::from(Span::styled(
-                    pad_to(dir_label, W_DIR),
-                    dir_style,
+                    pad_to(dir_label(&entry.direction), cw[6]),
+                    dstyle,
                 )));
             }
             if cols.pid {
                 cells.push(Cell::from(if entry.pid > 0 {
-                    format!("{:>width$}", entry.pid, width = W_PID)
+                    format!("{:>width$}", entry.pid, width = cw[7])
                 } else {
-                    pad_to("—", W_PID)
+                    pad_to("—", cw[7])
                 }));
             }
             if cols.process {
-                cells.push(Cell::from(entry.process_name.as_str()));
+                cells.push(Cell::from(pad_to(&entry.process_name, cw[8])));
             }
             if cols.user {
-                cells.push(Cell::from(entry.process_user.as_str()));
+                cells.push(Cell::from(pad_to(&entry.process_user, cw[9])));
             }
             if cols.memory {
                 cells.push(Cell::from(if entry.process_mem > 0 {
-                    format!("{:>width$}", mem_mb, width = W_MEM)
+                    format!("{:>width$}", mem_mb, width = cw[10])
                 } else {
-                    pad_to("—", W_MEM)
+                    pad_to("—", cw[10])
                 }));
             }
 
@@ -654,6 +661,141 @@ fn draw_bar_charts(f: &mut Frame, app: &App, area: Rect) {
 
         f.render_widget(chart, panels[panel_idx]);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Process detail overlay
+// ---------------------------------------------------------------------------
+
+fn draw_detail_view(f: &mut Frame, app: &App) {
+    let detail = match &app.detail {
+        Some(d) => d,
+        None => return,
+    };
+
+    let area = f.area();
+    f.render_widget(Clear, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header
+    lines.push(Line::from(Span::styled(
+        format!("  Process: {} (PID {})", detail.name, detail.pid),
+        Style::default().fg(Color::Cyan).bold(),
+    )));
+    lines.push(Line::from(format!("  User:    {}", detail.user)));
+    lines.push(Line::from(format!("  Command: {}", detail.cmdline)));
+    lines.push(Line::from(format!(
+        "  Memory:  {:.1} MB",
+        detail.mem_kb as f64 / 1024.0
+    )));
+    lines.push(Line::from(""));
+
+    // Connections section
+    lines.push(Line::from(Span::styled(
+        format!("  Connections ({})", detail.connections.len()),
+        Style::default().fg(Color::Yellow).bold(),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {:<6} {:<22} {:<22} {:<12} {:<10}",
+            "Proto", "Local", "Remote", "State", "Direction"
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    for conn in &detail.connections {
+        let local = format!("{}:{}", conn.local_addr, conn.local_port);
+        let remote = if conn.remote_port > 0 {
+            format!("{}:{}", conn.remote_addr, conn.remote_port)
+        } else {
+            format!("{}:—", conn.remote_addr)
+        };
+
+        let state_style = Style::default().fg(state_color(&conn.state));
+        let dir_style = Style::default().fg(direction_color(&conn.direction));
+
+        lines.push(Line::from(vec![
+            Span::raw(format!("  {:<6} {:<22} {:<22} ", conn.protocol, local, remote)),
+            Span::styled(format!("{:<12} ", conn.state), state_style),
+            Span::styled(conn.direction.clone(), dir_style),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+
+    // Open files section
+    let net_files: Vec<_> = detail
+        .open_files
+        .iter()
+        .filter(|f| matches!(f.file_type.as_str(), "IPv4" | "IPv6" | "sock" | "unix"))
+        .collect();
+    let reg_files: Vec<_> = detail
+        .open_files
+        .iter()
+        .filter(|f| !matches!(f.file_type.as_str(), "IPv4" | "IPv6" | "sock" | "unix"))
+        .collect();
+
+    if !net_files.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  Network File Descriptors ({})", net_files.len()),
+            Style::default().fg(Color::Green).bold(),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {:<6} {:<6} {}", "FD", "Type", "Name"),
+            Style::default().fg(Color::DarkGray),
+        )));
+        for of in &net_files {
+            lines.push(Line::from(format!(
+                "  {:<6} {:<6} {}",
+                of.fd, of.file_type, of.name
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if !reg_files.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  Open Files ({})", reg_files.len()),
+            Style::default().fg(Color::Magenta).bold(),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {:<6} {:<6} {}", "FD", "Type", "Name"),
+            Style::default().fg(Color::DarkGray),
+        )));
+        for of in &reg_files {
+            lines.push(Line::from(format!(
+                "  {:<6} {:<6} {}",
+                of.fd, of.file_type, of.name
+            )));
+        }
+    }
+
+    // Apply scroll
+    let viewport_height = area.height.saturating_sub(2) as usize; // borders
+    let max_scroll = lines.len().saturating_sub(viewport_height);
+    let offset = detail.scroll_offset.min(max_scroll);
+    let visible_lines: Vec<Line> = lines.into_iter().skip(offset).collect();
+
+    let scroll_hint = if max_scroll > 0 {
+        format!(
+            " j/k scroll | Esc/q back | line {}/{} ",
+            offset + 1,
+            max_scroll + viewport_height
+        )
+    } else {
+        " Esc/q back ".to_string()
+    };
+
+    let paragraph = Paragraph::new(visible_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(format!(" Process Detail — {} ", detail.name))
+            .title_bottom(Line::from(scroll_hint).alignment(Alignment::Right)),
+    );
+
+    f.render_widget(paragraph, area);
 }
 
 // ---------------------------------------------------------------------------
