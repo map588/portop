@@ -1,5 +1,6 @@
 use crate::app::{App, AppMode, SortField, SORT_FIELDS};
 use crate::config::OptionState;
+use crate::port_scanner::PortEntry;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
@@ -115,7 +116,7 @@ fn compute_column_widths(app: &App) -> [usize; 11] {
             w[0] = w[0].max(e.protocol.len());
             w[1] = w[1].max(display_width(&e.local_addr));
             w[2] = w[2].max(format!("{}", e.local_port).len());
-            w[3] = w[3].max(display_width(&e.remote_addr));
+            w[3] = w[3].max(display_width(&fmt_remote_addr(e)));
             w[4] = w[4].max(if e.remote_port > 0 {
                 format!("{}", e.remote_port).len()
             } else {
@@ -248,7 +249,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
                 )));
             }
             if cols.remote_addr {
-                cells.push(Cell::from(pad_to(&entry.remote_addr, cw[3])));
+                cells.push(Cell::from(pad_to(fmt_remote_addr(entry), cw[3])));
             }
             if cols.remote_port {
                 cells.push(Cell::from(if entry.remote_port > 0 {
@@ -706,17 +707,18 @@ fn draw_detail_view(f: &mut Frame, app: &App) {
 
     for conn in &detail.connections {
         let local = format!("{}:{}", conn.local_addr, conn.local_port);
+        let raddr = fmt_remote_addr(conn);
         let remote = if conn.remote_port > 0 {
-            format!("{}:{}", conn.remote_addr, conn.remote_port)
+            format!("{}:{}", raddr, conn.remote_port)
         } else {
-            format!("{}:—", conn.remote_addr)
+            format!("{}:—", raddr)
         };
 
         let state_style = Style::default().fg(state_color(&conn.state));
         let dir_style = Style::default().fg(direction_color(&conn.direction));
 
         lines.push(Line::from(vec![
-            Span::raw(format!("  {:<6} {:<22} {:<22} ", conn.protocol, local, remote)),
+            Span::raw(format!("  {:<6} {:<22} {:<30} ", conn.protocol, local, remote)),
             Span::styled(format!("{:<12} ", conn.state), state_style),
             Span::styled(conn.direction.clone(), dir_style),
         ]));
@@ -801,6 +803,14 @@ fn draw_detail_view(f: &mut Frame, app: &App) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Format remote address: `domain(ip)` if resolved, else just `ip`.
+fn fmt_remote_addr(entry: &PortEntry) -> String {
+    match &entry.remote_host {
+        Some(host) => format!("{}({})", host, entry.remote_addr),
+        None => entry.remote_addr.clone(),
+    }
+}
 
 fn state_color(state: &str) -> Color {
     match state {
@@ -909,5 +919,150 @@ fn truncate_str(s: &str, max: usize) -> String {
         truncate_to_width(s, max)
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::port_scanner::PortEntry;
+
+    // --- fmt_remote_addr ---
+
+    #[test]
+    fn fmt_remote_addr_no_host() {
+        let entry = PortEntry::test("TCP", "0.0.0.0", 80, "LISTEN")
+            .with_remote("10.0.0.1", 0);
+        assert_eq!(fmt_remote_addr(&entry), "10.0.0.1");
+    }
+
+    #[test]
+    fn fmt_remote_addr_with_host() {
+        let entry = PortEntry::test("TCP", "0.0.0.0", 80, "ESTABLISHED")
+            .with_remote("10.0.0.1", 443)
+            .with_host("example.com");
+        assert_eq!(fmt_remote_addr(&entry), "example.com(10.0.0.1)");
+    }
+
+    // --- format_bytes_rate ---
+
+    #[test]
+    fn format_bytes_rate_zero() {
+        assert_eq!(format_bytes_rate(0.0), "0 B/s");
+    }
+
+    #[test]
+    fn format_bytes_rate_bytes() {
+        assert_eq!(format_bytes_rate(500.0), "500 B/s");
+    }
+
+    #[test]
+    fn format_bytes_rate_kilobytes() {
+        assert_eq!(format_bytes_rate(1500.0), "1.5 KB/s");
+    }
+
+    #[test]
+    fn format_bytes_rate_megabytes() {
+        assert_eq!(format_bytes_rate(1_500_000.0), "1.5 MB/s");
+    }
+
+    #[test]
+    fn format_bytes_rate_gigabytes() {
+        assert_eq!(format_bytes_rate(1_500_000_000.0), "1.5 GB/s");
+    }
+
+    // --- pad_to ---
+
+    #[test]
+    fn pad_to_shorter_than_width() {
+        assert_eq!(pad_to("hi", 5), "hi   ");
+    }
+
+    #[test]
+    fn pad_to_exact_width() {
+        assert_eq!(pad_to("hello", 5), "hello");
+    }
+
+    #[test]
+    fn pad_to_longer_than_width() {
+        let result = pad_to("toolong", 4);
+        assert_eq!(display_width(&result), 4);
+        assert!(result.contains('…'));
+    }
+
+    // --- truncate_to_width ---
+
+    #[test]
+    fn truncate_to_width_zero() {
+        assert_eq!(truncate_to_width("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_to_width_one() {
+        assert_eq!(truncate_to_width("hello", 1), "…");
+    }
+
+    #[test]
+    fn truncate_to_width_mid() {
+        let result = truncate_to_width("hello world", 6);
+        assert_eq!(display_width(&result), 6);
+        assert!(result.starts_with("hello"));
+        assert!(result.contains('…'));
+    }
+
+    #[test]
+    fn truncate_to_width_short_string_padded() {
+        // "hi" fits within width=6 before the ellipsis slot, so result is "hi…   " padded
+        let result = truncate_to_width("hi", 6);
+        assert_eq!(display_width(&result), 6);
+        assert!(result.contains('…'));
+    }
+
+    // --- truncate_str ---
+
+    #[test]
+    fn truncate_str_no_truncation() {
+        assert_eq!(truncate_str("short", 10), "short");
+    }
+
+    #[test]
+    fn truncate_str_truncated() {
+        let result = truncate_str("a long string here", 6);
+        assert_eq!(display_width(&result), 6);
+        assert!(result.contains('…'));
+    }
+
+    // --- state_color ---
+
+    #[test]
+    fn state_color_listen() {
+        assert_eq!(state_color("LISTEN"), Color::Green);
+    }
+
+    #[test]
+    fn state_color_established() {
+        assert_eq!(state_color("ESTABLISHED"), Color::Yellow);
+    }
+
+    #[test]
+    fn state_color_unknown() {
+        assert_eq!(state_color("unknown"), Color::White);
+    }
+
+    // --- direction_color ---
+
+    #[test]
+    fn direction_color_listen() {
+        assert_eq!(direction_color("Listen"), Color::Green);
+    }
+
+    #[test]
+    fn direction_color_inbound() {
+        assert_eq!(direction_color("Inbound"), Color::Cyan);
+    }
+
+    #[test]
+    fn direction_color_unknown() {
+        assert_eq!(direction_color("unknown"), Color::White);
     }
 }

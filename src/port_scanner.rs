@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::net::ToSocketAddrs;
 
 #[derive(Debug, Clone)]
 pub struct PortEntry {
@@ -7,6 +8,8 @@ pub struct PortEntry {
     pub local_port: u16,
     pub remote_addr: String,
     pub remote_port: u16,
+    /// Resolved hostname for remote_addr, if available.
+    pub remote_host: Option<String>,
     pub state: String,
     pub direction: String,
     pub pid: u32,
@@ -16,17 +19,182 @@ pub struct PortEntry {
     pub process_mem: u64,
 }
 
+#[cfg(test)]
+impl PortEntry {
+    /// Test helper: create a PortEntry with minimal required fields.
+    pub fn test(proto: &str, local_addr: &str, local_port: u16, state: &str) -> Self {
+        Self {
+            protocol: proto.to_string(),
+            local_addr: local_addr.to_string(),
+            local_port,
+            remote_addr: "*".to_string(),
+            remote_port: 0,
+            remote_host: None,
+            state: state.to_string(),
+            direction: String::new(),
+            pid: 0,
+            process_name: "test".to_string(),
+            process_cmdline: "test".to_string(),
+            process_user: "user".to_string(),
+            process_mem: 0,
+        }
+    }
+
+    /// Builder: set remote address fields.
+    pub fn with_remote(mut self, addr: &str, port: u16) -> Self {
+        self.remote_addr = addr.to_string();
+        self.remote_port = port;
+        self
+    }
+
+    /// Builder: set PID and process name.
+    pub fn with_process(mut self, pid: u32, name: &str) -> Self {
+        self.pid = pid;
+        self.process_name = name.to_string();
+        self
+    }
+
+    /// Builder: set memory.
+    pub fn with_mem(mut self, mem_kb: u64) -> Self {
+        self.process_mem = mem_kb;
+        self
+    }
+
+    /// Builder: set resolved hostname.
+    pub fn with_host(mut self, host: &str) -> Self {
+        self.remote_host = Some(host.to_string());
+        self
+    }
+}
+
+/// Cache for reverse DNS lookups. Persists across scan cycles.
+pub struct DnsCache {
+    cache: HashMap<String, Option<String>>,
+}
+
+impl DnsCache {
+    pub fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+        }
+    }
+
+    /// Resolve IP addresses to hostnames for all entries, using the cache.
+    pub fn resolve_entries(&mut self, entries: &mut [PortEntry]) {
+        for entry in entries.iter_mut() {
+            if entry.remote_addr == "*" || entry.remote_addr.is_empty() {
+                continue;
+            }
+            let ip = &entry.remote_addr;
+            if !self.cache.contains_key(ip) {
+                let resolved = reverse_lookup(ip);
+                self.cache.insert(ip.clone(), resolved);
+            }
+            entry.remote_host = self.cache.get(ip).cloned().flatten();
+        }
+    }
+}
+
+fn reverse_lookup(ip: &str) -> Option<String> {
+    // Skip loopback / wildcard / link-local — not useful to resolve
+    if ip == "127.0.0.1" || ip == "::1" || ip.starts_with("127.") || ip == "*" {
+        return None;
+    }
+
+    // Use a dummy port for ToSocketAddrs; we only care about the reverse lookup
+    let sock_addr = format!("{}:0", ip);
+    let addr = sock_addr.to_socket_addrs().ok()?.next()?;
+
+    // std doesn't have reverse DNS, use libc getnameinfo
+    resolve_addr(&addr)
+}
+
+#[cfg(unix)]
+fn resolve_addr(addr: &std::net::SocketAddr) -> Option<String> {
+    use std::ffi::CStr;
+
+    // Build a sockaddr on the stack, then pass a pointer to getnameinfo.
+    // macOS/BSD sockaddr structs have a sin_len/sin6_len field; Linux does not.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let sa_len: libc::socklen_t;
+
+    match addr {
+        std::net::SocketAddr::V4(v4) => {
+            let sin = &mut storage as *mut _ as *mut libc::sockaddr_in;
+            unsafe {
+                (*sin).sin_family = libc::AF_INET as libc::sa_family_t;
+                (*sin).sin_port = v4.port().to_be();
+                (*sin).sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+                #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+                {
+                    (*sin).sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+                }
+            }
+            sa_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        }
+        std::net::SocketAddr::V6(v6) => {
+            let sin6 = &mut storage as *mut _ as *mut libc::sockaddr_in6;
+            unsafe {
+                (*sin6).sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                (*sin6).sin6_port = v6.port().to_be();
+                (*sin6).sin6_flowinfo = v6.flowinfo();
+                (*sin6).sin6_addr.s6_addr = v6.ip().octets();
+                (*sin6).sin6_scope_id = v6.scope_id();
+                #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+                {
+                    (*sin6).sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+                }
+            }
+            sa_len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+        }
+    }
+
+    let sa_ptr = &storage as *const _ as *const libc::sockaddr;
+    let mut host_buf = [0u8; 256];
+    let ret = unsafe {
+        libc::getnameinfo(
+            sa_ptr,
+            sa_len,
+            host_buf.as_mut_ptr() as *mut libc::c_char,
+            host_buf.len() as libc::socklen_t,
+            std::ptr::null_mut(),
+            0,
+            0,
+        )
+    };
+
+    if ret != 0 {
+        return None;
+    }
+
+    let hostname = unsafe { CStr::from_ptr(host_buf.as_ptr() as *const libc::c_char) }
+        .to_string_lossy()
+        .into_owned();
+
+    // getnameinfo returns the numeric IP if it can't resolve — skip those
+    if hostname == addr.ip().to_string() {
+        return None;
+    }
+
+    Some(hostname)
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_addr(_addr: &std::net::SocketAddr) -> Option<String> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Shared: direction inference
 // ---------------------------------------------------------------------------
 
-fn is_loopback(addr: &str) -> bool {
+pub(crate) fn is_loopback(addr: &str) -> bool {
     addr == "127.0.0.1" || addr.starts_with("127.") || addr == "::1"
 }
 
 /// Compute the `direction` field for every entry based on state, addresses,
 /// and whether the local port has a corresponding LISTEN socket.
-fn compute_directions(entries: &mut [PortEntry]) {
+pub(crate) fn compute_directions(entries: &mut [PortEntry]) {
     let listen_ports: HashSet<u16> = entries
         .iter()
         .filter(|e| e.state == "LISTEN")
@@ -182,6 +350,7 @@ fn scan_net_file(
             local_port,
             remote_addr: remote_ip,
             remote_port,
+            remote_host: None,
             state,
             direction: String::new(),
             pid,
@@ -193,7 +362,7 @@ fn scan_net_file(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[allow(dead_code)] // used on Linux; tested on all platforms
 fn parse_address_linux(addr: &str) -> (String, u16) {
     let parts: Vec<&str> = addr.split(':').collect();
     if parts.len() != 2 {
@@ -234,7 +403,7 @@ fn parse_address_linux(addr: &str) -> (String, u16) {
     (ip, port)
 }
 
-#[cfg(target_os = "linux")]
+#[allow(dead_code)] // used on Linux; tested on all platforms
 fn decode_state(state_hex: &str, proto: &str) -> String {
     if proto.starts_with("udp") {
         match state_hex {
@@ -425,7 +594,6 @@ pub fn scan_ports() -> Vec<PortEntry> {
     entries
 }
 
-#[cfg(target_os = "macos")]
 fn parse_lsof_line(line: &str) -> Option<PortEntry> {
     let fields: Vec<&str> = line.split_whitespace().collect();
     if fields.len() < 9 {
@@ -458,6 +626,7 @@ fn parse_lsof_line(line: &str) -> Option<PortEntry> {
         local_port,
         remote_addr,
         remote_port,
+        remote_host: None,
         state,
         direction: String::new(),
         pid,
@@ -468,7 +637,6 @@ fn parse_lsof_line(line: &str) -> Option<PortEntry> {
     })
 }
 
-#[cfg(target_os = "macos")]
 fn parse_lsof_name(
     name: &str,
     proto: &str,
@@ -496,7 +664,6 @@ fn parse_lsof_name(
     Some((local_addr, local_port, remote_addr, remote_port, state))
 }
 
-#[cfg(target_os = "macos")]
 fn decode_lsof_escapes(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -523,7 +690,6 @@ fn decode_lsof_escapes(s: &str) -> String {
     result
 }
 
-#[cfg(target_os = "macos")]
 fn parse_host_port(s: &str) -> Option<(String, u16)> {
     if let Some(idx) = s.rfind(':') {
         let host = &s[..idx];
@@ -665,6 +831,7 @@ pub fn scan_ports() -> Vec<PortEntry> {
             local_port,
             remote_addr,
             remote_port,
+            remote_host: None,
             state,
             direction: String::new(),
             pid,
@@ -690,7 +857,7 @@ pub fn scan_ports() -> Vec<PortEntry> {
     entries
 }
 
-#[cfg(target_os = "windows")]
+#[allow(dead_code)] // used on Windows; tested on all platforms
 fn parse_windows_address(addr: &str) -> (String, u16) {
     if addr == "*:*" {
         return ("*".to_string(), 0);
@@ -716,12 +883,398 @@ fn parse_windows_address(addr: &str) -> (String, u16) {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[allow(dead_code)] // used on Windows; tested on all platforms
 fn normalize_windows_state(state: &str) -> String {
     match state {
         "LISTENING" => "LISTEN".to_string(),
         "FIN_WAIT_1" => "FIN_WAIT1".to_string(),
         "FIN_WAIT_2" => "FIN_WAIT2".to_string(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // compute_directions
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_direction_listen() {
+        let mut entries = vec![PortEntry::test("tcp", "0.0.0.0", 80, "LISTEN")];
+        compute_directions(&mut entries);
+        assert_eq!(entries[0].direction, "Listen");
+    }
+
+    #[test]
+    fn test_direction_syn_sent() {
+        let mut entries = vec![
+            PortEntry::test("tcp", "192.168.1.1", 54321, "SYN_SENT")
+                .with_remote("10.0.0.1", 443),
+        ];
+        compute_directions(&mut entries);
+        assert_eq!(entries[0].direction, "Outbound");
+    }
+
+    #[test]
+    fn test_direction_syn_recv() {
+        let mut entries = vec![
+            PortEntry::test("tcp", "192.168.1.1", 80, "SYN_RECV")
+                .with_remote("10.0.0.1", 54321),
+        ];
+        compute_directions(&mut entries);
+        assert_eq!(entries[0].direction, "Inbound");
+    }
+
+    #[test]
+    fn test_direction_local_wildcard_remote() {
+        // remote_addr == "*"
+        let mut entries = vec![
+            PortEntry::test("tcp", "0.0.0.0", 8080, "ESTABLISHED"),
+        ];
+        // default remote is "*" from PortEntry::test
+        compute_directions(&mut entries);
+        assert_eq!(entries[0].direction, "Local");
+    }
+
+    #[test]
+    fn test_direction_local_zero_remote_port() {
+        // remote_port == 0
+        let mut entries = vec![
+            PortEntry::test("udp", "0.0.0.0", 53, "OPEN")
+                .with_remote("10.0.0.1", 0),
+        ];
+        compute_directions(&mut entries);
+        assert_eq!(entries[0].direction, "Local");
+    }
+
+    #[test]
+    fn test_direction_loopback() {
+        let mut entries = vec![
+            PortEntry::test("tcp", "127.0.0.1", 9000, "ESTABLISHED")
+                .with_remote("::1", 54321),
+        ];
+        compute_directions(&mut entries);
+        assert_eq!(entries[0].direction, "Loopback");
+    }
+
+    #[test]
+    fn test_direction_inbound_via_listen_port() {
+        // Port 443 has a LISTEN entry; established connection on same port → Inbound
+        let mut entries = vec![
+            PortEntry::test("tcp", "0.0.0.0", 443, "LISTEN"),
+            PortEntry::test("tcp", "192.168.1.1", 443, "ESTABLISHED")
+                .with_remote("10.0.0.1", 54321),
+        ];
+        compute_directions(&mut entries);
+        assert_eq!(entries[0].direction, "Listen");
+        assert_eq!(entries[1].direction, "Inbound");
+    }
+
+    #[test]
+    fn test_direction_outbound_default() {
+        // Non-loopback, no LISTEN on local port, not a special state
+        let mut entries = vec![
+            PortEntry::test("tcp", "192.168.1.1", 54321, "ESTABLISHED")
+                .with_remote("93.184.216.34", 443),
+        ];
+        compute_directions(&mut entries);
+        assert_eq!(entries[0].direction, "Outbound");
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_lsof_line
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_lsof_line_tcp_ipv4() {
+        let line = "Google   1234    user   12u  IPv4 0x1234      0t0  TCP  192.168.1.1:443->10.0.0.1:52000 (ESTABLISHED)";
+        let entry = parse_lsof_line(line).expect("should parse");
+        assert_eq!(entry.protocol, "tcp");
+        assert_eq!(entry.local_addr, "192.168.1.1");
+        assert_eq!(entry.local_port, 443);
+        assert_eq!(entry.remote_addr, "10.0.0.1");
+        assert_eq!(entry.remote_port, 52000);
+        assert_eq!(entry.state, "ESTABLISHED");
+        assert_eq!(entry.pid, 1234);
+        assert_eq!(entry.process_name, "Google");
+        assert_eq!(entry.process_user, "user");
+    }
+
+    #[test]
+    fn test_parse_lsof_line_tcp_ipv6() {
+        let line = "Firefox  5678    user   15u  IPv6 0x5678      0t0  TCP  [::1]:8080 (LISTEN)";
+        let entry = parse_lsof_line(line).expect("should parse");
+        assert_eq!(entry.protocol, "tcp6");
+        assert_eq!(entry.local_addr, "::1");
+        assert_eq!(entry.local_port, 8080);
+        assert_eq!(entry.state, "LISTEN");
+        assert_eq!(entry.pid, 5678);
+    }
+
+    #[test]
+    fn test_parse_lsof_line_udp() {
+        let line = "dns      9999    root   10u  IPv4 0xabcd      0t0  UDP  *:53";
+        let entry = parse_lsof_line(line).expect("should parse");
+        assert_eq!(entry.protocol, "udp");
+        assert_eq!(entry.local_addr, "*");
+        assert_eq!(entry.local_port, 53);
+        assert_eq!(entry.state, "OPEN");
+        assert_eq!(entry.pid, 9999);
+    }
+
+    #[test]
+    fn test_parse_lsof_line_non_network_node() {
+        // node field is "REG", not TCP/UDP
+        let line = "proc     1234    user   12u  IPv4 0x1234      0t0  REG  /some/file";
+        assert!(parse_lsof_line(line).is_none());
+    }
+
+    #[test]
+    fn test_parse_lsof_line_too_few_fields() {
+        let line = "proc 1234 user";
+        assert!(parse_lsof_line(line).is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_lsof_name
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_lsof_name_tcp_with_arrow_and_state() {
+        let result = parse_lsof_name("192.168.1.1:443->10.0.0.1:52000 (ESTABLISHED)", "tcp")
+            .expect("should parse");
+        let (local_addr, local_port, remote_addr, remote_port, state) = result;
+        assert_eq!(local_addr, "192.168.1.1");
+        assert_eq!(local_port, 443);
+        assert_eq!(remote_addr, "10.0.0.1");
+        assert_eq!(remote_port, 52000);
+        assert_eq!(state, "ESTABLISHED");
+    }
+
+    #[test]
+    fn test_parse_lsof_name_listen_no_arrow() {
+        let result = parse_lsof_name("*:80 (LISTEN)", "tcp").expect("should parse");
+        let (local_addr, local_port, remote_addr, remote_port, state) = result;
+        assert_eq!(local_addr, "*");
+        assert_eq!(local_port, 80);
+        assert_eq!(remote_addr, "*");
+        assert_eq!(remote_port, 0);
+        assert_eq!(state, "LISTEN");
+    }
+
+    #[test]
+    fn test_parse_lsof_name_udp_no_state() {
+        let result = parse_lsof_name("*:53", "udp").expect("should parse");
+        let (_local_addr, local_port, _remote_addr, _remote_port, state) = result;
+        assert_eq!(local_port, 53);
+        assert_eq!(state, "OPEN");
+    }
+
+    #[test]
+    fn test_parse_lsof_name_ipv6_bracket() {
+        let result = parse_lsof_name("[::1]:8080 (LISTEN)", "tcp6").expect("should parse");
+        let (local_addr, local_port, _remote_addr, _remote_port, state) = result;
+        assert_eq!(local_addr, "::1");
+        assert_eq!(local_port, 8080);
+        assert_eq!(state, "LISTEN");
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_host_port
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_host_port_ipv4() {
+        let (host, port) = parse_host_port("192.168.1.1:443").expect("should parse");
+        assert_eq!(host, "192.168.1.1");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv6_bracket() {
+        let (host, port) = parse_host_port("[::1]:8080").expect("should parse");
+        assert_eq!(host, "::1");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn test_parse_host_port_wildcard() {
+        let (host, port) = parse_host_port("*:80").expect("should parse");
+        assert_eq!(host, "*");
+        assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn test_parse_host_port_no_colon() {
+        assert!(parse_host_port("invalid").is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // decode_lsof_escapes
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_lsof_escapes_hex() {
+        assert_eq!(decode_lsof_escapes("hello\\x20world"), "hello world");
+    }
+
+    #[test]
+    fn test_decode_lsof_escapes_no_escapes() {
+        assert_eq!(decode_lsof_escapes("no-escapes"), "no-escapes");
+    }
+
+    #[test]
+    fn test_decode_lsof_escapes_trailing_backslash() {
+        // A lone trailing backslash should be kept as-is (no valid hex follows)
+        assert_eq!(decode_lsof_escapes("trail\\"), "trail\\");
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_address_linux
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_address_linux_ipv4() {
+        let (ip, port) = parse_address_linux("0100007F:0050");
+        assert_eq!(ip, "127.0.0.1");
+        assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn test_parse_address_linux_all_zeros() {
+        let (ip, port) = parse_address_linux("00000000:0000");
+        assert_eq!(ip, "0.0.0.0");
+        assert_eq!(port, 0);
+    }
+
+    #[test]
+    fn test_parse_address_linux_invalid_no_colon() {
+        let (ip, port) = parse_address_linux("invalid");
+        assert_eq!(ip, "invalid");
+        assert_eq!(port, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // decode_state
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_state_tcp_listen() {
+        assert_eq!(decode_state("0A", "tcp"), "LISTEN");
+    }
+
+    #[test]
+    fn test_decode_state_tcp_established() {
+        assert_eq!(decode_state("01", "tcp"), "ESTABLISHED");
+    }
+
+    #[test]
+    fn test_decode_state_tcp_time_wait() {
+        assert_eq!(decode_state("06", "tcp"), "TIME_WAIT");
+    }
+
+    #[test]
+    fn test_decode_state_udp_unreplied() {
+        assert_eq!(decode_state("07", "udp"), "UNREPLIED");
+    }
+
+    #[test]
+    fn test_decode_state_udp_established() {
+        assert_eq!(decode_state("01", "udp"), "ESTABLISHED");
+    }
+
+    #[test]
+    fn test_decode_state_unknown() {
+        assert_eq!(decode_state("FF", "tcp"), "STATE(FF)");
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_windows_address
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_windows_address_wildcard() {
+        let (ip, port) = parse_windows_address("*:*");
+        assert_eq!(ip, "*");
+        assert_eq!(port, 0);
+    }
+
+    #[test]
+    fn test_parse_windows_address_ipv4() {
+        let (ip, port) = parse_windows_address("0.0.0.0:80");
+        assert_eq!(ip, "0.0.0.0");
+        assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn test_parse_windows_address_ipv6() {
+        let (ip, port) = parse_windows_address("[::]:443");
+        assert_eq!(ip, "::");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn test_parse_windows_address_ipv6_loopback() {
+        let (ip, port) = parse_windows_address("[::1]:8080");
+        assert_eq!(ip, "::1");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn test_parse_windows_address_no_colon() {
+        let (ip, port) = parse_windows_address("noport");
+        assert_eq!(ip, "noport");
+        assert_eq!(port, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // normalize_windows_state
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_windows_state_listening() {
+        assert_eq!(normalize_windows_state("LISTENING"), "LISTEN");
+    }
+
+    #[test]
+    fn test_normalize_windows_state_fin_wait_1() {
+        assert_eq!(normalize_windows_state("FIN_WAIT_1"), "FIN_WAIT1");
+    }
+
+    #[test]
+    fn test_normalize_windows_state_established_passthrough() {
+        assert_eq!(normalize_windows_state("ESTABLISHED"), "ESTABLISHED");
+    }
+
+    // -------------------------------------------------------------------------
+    // is_loopback
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_is_loopback_127_0_0_1() {
+        assert!(is_loopback("127.0.0.1"));
+    }
+
+    #[test]
+    fn test_is_loopback_127_prefix() {
+        assert!(is_loopback("127.0.0.2"));
+    }
+
+    #[test]
+    fn test_is_loopback_ipv6() {
+        assert!(is_loopback("::1"));
+    }
+
+    #[test]
+    fn test_is_loopback_non_loopback() {
+        assert!(!is_loopback("10.0.0.1"));
+    }
+
+    #[test]
+    fn test_is_loopback_wildcard() {
+        assert!(!is_loopback("*"));
     }
 }

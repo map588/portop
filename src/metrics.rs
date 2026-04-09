@@ -121,3 +121,175 @@ impl MetricsHistory {
             .fold(100.0_f64, f64::max) // at least 100 B/s for readable axis
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net_stats::InterfaceStats;
+    use crate::port_scanner::PortEntry;
+
+    // ------------------------------------------------------------------
+    // 1. MetricsHistory::new — initial state
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn new_has_empty_histories_and_zero_rates() {
+        let m = MetricsHistory::new();
+        assert!(m.rx_history.is_empty());
+        assert!(m.tx_history.is_empty());
+        assert_eq!(m.current_rx, 0.0);
+        assert_eq!(m.current_tx, 0.0);
+        assert!(m.state_counts.is_empty());
+        assert!(m.top_processes.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // 2. update_state_counts (via update)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn state_counts_sorted_descending() {
+        let entries = vec![
+            PortEntry::test("tcp", "0.0.0.0", 80, "LISTEN"),
+            PortEntry::test("tcp", "0.0.0.0", 443, "LISTEN"),
+            PortEntry::test("tcp", "0.0.0.0", 8080, "LISTEN"),
+            PortEntry::test("tcp", "0.0.0.0", 22, "ESTABLISHED"),
+            PortEntry::test("tcp", "0.0.0.0", 23, "ESTABLISHED"),
+            PortEntry::test("tcp", "0.0.0.0", 9000, "TIME_WAIT"),
+        ];
+
+        let mut m = MetricsHistory::new();
+        m.update(&entries, vec![]);
+
+        assert_eq!(m.state_counts.len(), 3);
+        assert_eq!(m.state_counts[0], ("LISTEN".to_string(), 3));
+        assert_eq!(m.state_counts[1], ("ESTABLISHED".to_string(), 2));
+        assert_eq!(m.state_counts[2], ("TIME_WAIT".to_string(), 1));
+    }
+
+    #[test]
+    fn state_counts_empty_entries() {
+        let mut m = MetricsHistory::new();
+        m.update(&[], vec![]);
+        assert!(m.state_counts.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // 3. update_top_processes (via update)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn top_processes_sorted_descending_and_pid_zero_excluded() {
+        let entries = vec![
+            PortEntry::test("tcp", "0.0.0.0", 80, "LISTEN").with_process(1, "nginx"),
+            PortEntry::test("tcp", "0.0.0.0", 443, "LISTEN").with_process(1, "nginx"),
+            PortEntry::test("tcp", "0.0.0.0", 8080, "LISTEN").with_process(1, "nginx"),
+            PortEntry::test("tcp", "0.0.0.0", 9000, "ESTABLISHED").with_process(2, "chrome"),
+            PortEntry::test("tcp", "0.0.0.0", 9001, "ESTABLISHED").with_process(2, "chrome"),
+            PortEntry::test("tcp", "0.0.0.0", 22, "ESTABLISHED").with_process(3, "ssh"),
+            // pid == 0: should be excluded
+            PortEntry::test("tcp", "0.0.0.0", 1234, "ESTABLISHED"),
+        ];
+
+        let mut m = MetricsHistory::new();
+        m.update(&entries, vec![]);
+
+        assert_eq!(m.top_processes.len(), 3);
+        assert_eq!(m.top_processes[0], ("nginx".to_string(), 3));
+        assert_eq!(m.top_processes[1], ("chrome".to_string(), 2));
+        assert_eq!(m.top_processes[2], ("ssh".to_string(), 1));
+    }
+
+    #[test]
+    fn top_processes_truncated_to_eight() {
+        // 10 unique processes — only the top 8 should survive
+        let mut entries = Vec::new();
+        for i in 0..10u32 {
+            let count = 10 - i; // process 0 has count 10, process 9 has count 1
+            for _ in 0..count {
+                entries.push(
+                    PortEntry::test("tcp", "0.0.0.0", (i * 100) as u16, "ESTABLISHED")
+                        .with_process(i + 1, &format!("proc{}", i)),
+                );
+            }
+        }
+
+        let mut m = MetricsHistory::new();
+        m.update(&entries, vec![]);
+
+        assert_eq!(m.top_processes.len(), 8);
+        // Highest count first
+        assert_eq!(m.top_processes[0].0, "proc0");
+        assert_eq!(m.top_processes[0].1, 10);
+    }
+
+    // ------------------------------------------------------------------
+    // 4. max_net_rate
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn max_net_rate_empty_returns_floor() {
+        let m = MetricsHistory::new();
+        assert_eq!(m.max_net_rate(), 100.0);
+    }
+
+    #[test]
+    fn max_net_rate_returns_max_of_rx_and_tx() {
+        let mut m = MetricsHistory::new();
+        m.rx_history.push_back(200.0);
+        m.rx_history.push_back(150.0);
+        m.tx_history.push_back(500.0);
+        m.tx_history.push_back(300.0);
+        assert_eq!(m.max_net_rate(), 500.0);
+    }
+
+    // ------------------------------------------------------------------
+    // 5. update integration — net rates computed on second call
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn net_rates_stay_zero_on_first_update() {
+        let stats = vec![InterfaceStats {
+            name: "eth0".to_string(),
+            rx_bytes: 1000,
+            tx_bytes: 2000,
+        }];
+
+        let mut m = MetricsHistory::new();
+        m.update(&[], stats);
+
+        // First call has no prev_stats, so rates must remain 0
+        assert_eq!(m.current_rx, 0.0);
+        assert_eq!(m.current_tx, 0.0);
+        assert!(m.rx_history.is_empty());
+        assert!(m.tx_history.is_empty());
+    }
+
+    #[test]
+    fn net_rates_computed_on_second_update() {
+        let stats1 = vec![InterfaceStats {
+            name: "eth0".to_string(),
+            rx_bytes: 0,
+            tx_bytes: 0,
+        }];
+        let stats2 = vec![InterfaceStats {
+            name: "eth0".to_string(),
+            rx_bytes: 10_000,
+            tx_bytes: 5_000,
+        }];
+
+        let mut m = MetricsHistory::new();
+        m.update(&[], stats1);
+
+        // Sleep briefly so elapsed >= 0.01 s threshold
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        m.update(&[], stats2);
+
+        // Rates must now be positive
+        assert!(m.current_rx > 0.0, "expected rx > 0, got {}", m.current_rx);
+        assert!(m.current_tx > 0.0, "expected tx > 0, got {}", m.current_tx);
+        assert_eq!(m.rx_history.len(), 1);
+        assert_eq!(m.tx_history.len(), 1);
+    }
+}

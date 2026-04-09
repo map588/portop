@@ -197,11 +197,12 @@ impl App {
                     return true;
                 }
                 let searchable = format!(
-                    "{} {} {} {} {} {} {} {}",
+                    "{} {} {} {} {} {} {} {} {}",
                     e.protocol,
                     e.local_addr,
                     e.local_port,
                     e.remote_addr,
+                    e.remote_host.as_deref().unwrap_or(""),
                     e.remote_port,
                     e.direction,
                     e.process_name,
@@ -595,6 +596,7 @@ fn scanner_loop(
 ) {
     let poll_interval = Duration::from_millis(100);
     let mut last_scan = Instant::now() - Duration::from_secs(60);
+    let mut dns_cache = port_scanner::DnsCache::new();
 
     loop {
         let current_interval = interval.load(Ordering::Relaxed);
@@ -602,8 +604,9 @@ fn scanner_loop(
             || last_scan.elapsed() >= Duration::from_secs(current_interval);
 
         if should_scan {
-            let entries = port_scanner::scan_ports();
+            let mut entries = port_scanner::scan_ports();
             let interface_stats = net_stats::collect_interface_stats();
+            dns_cache.resolve_entries(&mut entries);
             last_scan = Instant::now();
 
             if tx.send(ScanResult { entries, interface_stats }).is_err() {
